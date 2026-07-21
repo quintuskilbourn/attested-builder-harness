@@ -1,0 +1,521 @@
+{
+  "meta": {
+    "env": "multi-pair",
+    "hold_seed": 97,
+    "n_hold": 300,
+    "constraints": [
+      "Spine-R (structural)",
+      "regret blockstart L-inf",
+      "regret blockstart L-inf +sanit",
+      "regret blockstart L2",
+      "regret blockstart p95",
+      "regret blockstart vol-summed"
+    ]
+  },
+  "per_constraint": {
+    "Spine-R (structural)": {
+      "champion_code": "import harness as H\nimport math\n\nFEE = 0.003\nFRACS = [0.0001, 0.0002, 0.0003, 0.0005, 0.0008, 0.001, 0.0013, 0.0015, 0.002, 0.0025,\n         0.003, 0.0035, 0.004, 0.005, 0.006, 0.007, 0.008, 0.0095, 0.011,\n         0.013, 0.015, 0.0175, 0.02, 0.0225, 0.025, 0.028, 0.032, 0.036, 0.04,\n         0.045, 0.05, 0.055, 0.06, 0.067, 0.075, 0.082, 0.09, 0.1, 0.11, 0.12,\n         0.13, 0.14, 0.155, 0.17, 0.18, 0.195, 0.21, 0.225, 0.24, 0.26, 0.28,\n         0.3, 0.32, 0.345, 0.37, 0.395, 0.42, 0.45, 0.48, 0.515, 0.55, 0.59,\n         0.63, 0.675, 0.72, 0.775, 0.83, 0.89, 0.95, 1.02, 1.1, 1.17, 1.25,\n         1.33, 1.42, 1.5, 1.6, 1.72, 1.85, 1.97, 2.1, 2.27, 2.45, 2.6, 2.8,\n         3.0, 3.2, 3.4, 3.6, 3.85, 4.1, 4.35, 4.6, 4.95, 5.3, 5.65, 6.0, 6.5,\n         7.0, 7.5, 8.0, 9.0, 10.0, 11.5, 13.0, 15.0]\n\n\ndef _aout(rin, rout, ain):\n    if not math.isfinite(ain) or ain <= 0:\n        return 0.0\n    ain = min(ain, 1e13)\n    a = ain * (1.0 - FEE)\n    o = (a * rout) / (rin + a)\n    return o if math.isfinite(o) else rout\n\n\ndef _apply(x, y, orders):\n    for o in orders:\n        if o.side == \"buy\":\n            out = _aout(y, x, o.amount_in); y += o.amount_in; x -= out\n        else:\n            out = _aout(x, y, o.amount_in); x += o.amount_in; y -= out\n    return x, y\n\n\ndef _buy_pnl(x0, y0, mids, F):\n    if not math.isfinite(F) or F <= 0 or F >= 1e12:\n        return -1e18, 0.0\n    out = _aout(y0, x0, F); x = x0 - out; y = y0 + F; T = out\n    x, y = _apply(x, y, mids)\n    back = _aout(x, y, T)\n    return back - F, T\n\n\ndef _sell_pnl(x0, y0, mids, S):\n    if not math.isfinite(S) or S <= 0 or S >= 1e12:\n        return -1e18, 0.0\n    N = _aout(x0, y0, S); x = x0 + S; y = y0 - N\n    x, y = _apply(x, y, mids)\n    if x <= S:\n        return -1e18, 0.0\n    a = S * y / (x - S)\n    M = a / (1.0 - FEE)\n    if not math.isfinite(M) or M <= 0 or M >= 1e12:\n        return -1e18, 0.0\n    return N - M, M\n\n\ndef _refine(fn, x0, y0, mids, scale, lo, hi):\n    for _ in range(220):\n        m1 = lo + (hi - lo) / 3.0\n        m2 = hi - (hi - lo) / 3.0\n        p1 = fn(x0, y0, mids, m1 * scale)[0]\n        p2 = fn(x0, y0, mids, m2 * scale)[0]\n        if p1 < p2:\n            lo = m1\n        else:\n            hi = m2\n    f = 0.5 * (lo + hi)\n    return f * scale, fn(x0, y0, mids, f * scale)\n\n\ndef _best(fn, x0, y0, mids, scale):\n    best = (0.0, None)\n    bi = -1\n    for i, f in enumerate(FRACS):\n        pnl, aux = fn(x0, y0, mids, f * scale)\n        if pnl > best[0]:\n            best = (pnl, (f * scale, aux)); bi = i\n    if bi >= 0:\n        lo = FRACS[bi - 1] if bi > 0 else FRACS[0] * 0.1\n        hi = FRACS[bi + 1] if bi + 1 < len(FRACS) else FRACS[bi] * 1.5\n        size, (pnl, aux) = _refine(fn, x0, y0, mids, scale, lo, hi)\n        if pnl > best[0]:\n            best = (pnl, (size, aux))\n    return best\n\n\ndef _plan_buy(cx, cy, buys, actor, k):\n    seg = []\n    if not buys:\n        return seg, 0.0, cx, cy, k\n    pnl, info = _best(_buy_pnl, cx, cy, buys, cy)\n    if info is not None and pnl > 1e-9:\n        size, T = info\n        if math.isfinite(size) and 0 < size < 1e12 and math.isfinite(T) and T > 0:\n            seg.append(H.Order(actor, \"buy\", size, -1, \"BF%d\" % k, 0.0, actor))\n            seg.extend(buys)\n            seg.append(H.Order(actor, \"sell\", T, 10**9, \"BB%d\" % k, 0.0, actor))\n            out2 = _aout(cy, cx, size); cx -= out2; cy += size\n            cx, cy = _apply(cx, cy, buys)\n            bk = _aout(cx, cy, T); cx += T; cy -= bk\n            return seg, pnl, cx, cy, k + 1\n    seg.extend(buys)\n    cx, cy = _apply(cx, cy, buys)\n    return seg, 0.0, cx, cy, k\n\n\ndef _plan_sell(cx, cy, sells, actor, k):\n    seg = []\n    if not sells:\n        return seg, 0.0, cx, cy, k\n    pnl, info = _best(_sell_pnl, cx, cy, sells, cx)\n    if info is not None and pnl > 1e-9:\n        size, M = info\n        if math.isfinite(size) and 0 < size < 1e12 and math.isfinite(M) and M > 0:\n            seg.append(H.Order(actor, \"sell\", size, -1, \"SF%d\" % k, 0.0, actor))\n            seg.extend(sells)\n            seg.append(H.Order(actor, \"buy\", M, 10**9, \"SB%d\" % k, 0.0, actor))\n            N = _aout(cx, cy, size); cx += size; cy -= N\n            cx, cy = _apply(cx, cy, sells)\n            mo = _aout(cy, cx, M); cx -= mo; cy += M\n            return seg, pnl, cx, cy, k + 1\n    seg.extend(sells)\n    cx, cy = _apply(cx, cy, sells)\n    return seg, 0.0, cx, cy, k\n\n\ndef build(base, book):\n    ordering = H.baseline_priority_fee(base)\n    by_pool = {}\n    for o in ordering:\n        by_pool.setdefault(o.pool, []).append(o)\n\n    out = []\n    k = 0\n    for pid, mids in by_pool.items():\n        p = book.get(pid)\n        if p is None:\n            out.extend(mids)\n            continue\n        x0, y0 = p.x, p.y\n        buys = [o for o in mids if o.side == \"buy\"]\n        sells = [o for o in mids if o.side == \"sell\"]\n        actor = \"bld_\" + str(pid)\n\n        # try buy-first ordering\n        sb, pb, cx, cy, k1 = _plan_buy(x0, y0, buys, actor, k)\n        ss, ps, _, _, k2 = _plan_sell(cx, cy, sells, actor, k1)\n        seg_bf = sb + ss\n        tot_bf = pb + ps\n\n        # try sell-first ordering\n        ss2, ps2, cx2, cy2, k3 = _plan_sell(x0, y0, sells, actor, k)\n        sb2, pb2, _, _, k4 = _plan_buy(cx2, cy2, buys, actor, k3)\n        seg_sf = ss2 + sb2\n        tot_sf = pb2 + ps2\n\n        if tot_sf > tot_bf + 1e-9:\n            for o in seg_sf:\n                o.pool = pid\n            out.extend(seg_sf)\n            k = k4\n        else:\n            for o in seg_bf:\n                o.pool = pid\n            out.extend(seg_bf)\n            k = k2\n\n    return out",
+      "applied_rate": 1.0,
+      "objective_means": {
+        "worst_user_harm": 0.9977,
+        "total_slippage": 9.1157,
+        "n_users_harmed": 9.2467,
+        "p95_user_harm": 0.9977,
+        "harm_top1_share": 0.122,
+        "block_value": 1810389.255,
+        "private_extraction": 1810270.3987,
+        "total_user_surplus": -9.1157
+      },
+      "cross_acceptance": {
+        "Spine-R (structural)": 1.0,
+        "regret blockstart L-inf": 0.0,
+        "regret blockstart L-inf +sanit": 0.0,
+        "regret blockstart L2": 0.0,
+        "regret blockstart p95": 0.0,
+        "regret blockstart vol-summed": 0.0
+      },
+      "instructive_examples": [
+        {
+          "worst_user_harm": 0.9981,
+          "n_users_harmed": 10,
+          "block_value": 2347825.4
+        },
+        {
+          "worst_user_harm": 0.9982,
+          "n_users_harmed": 9,
+          "block_value": 2802805.6
+        },
+        {
+          "worst_user_harm": 0.9982,
+          "n_users_harmed": 9,
+          "block_value": 2109776.3
+        },
+        {
+          "worst_user_harm": 0.9972,
+          "n_users_harmed": 7,
+          "block_value": 653271.3
+        },
+        {
+          "worst_user_harm": 0.9981,
+          "n_users_harmed": 11,
+          "block_value": 3117854.0
+        },
+        {
+          "worst_user_harm": 0.9981,
+          "n_users_harmed": 7,
+          "block_value": 1477202.6
+        },
+        {
+          "worst_user_harm": 0.9982,
+          "n_users_harmed": 14,
+          "block_value": 2745407.1
+        },
+        {
+          "worst_user_harm": 0.998,
+          "n_users_harmed": 6,
+          "block_value": 1149286.1
+        },
+        {
+          "worst_user_harm": 0.9982,
+          "n_users_harmed": 13,
+          "block_value": 3179974.1
+        },
+        {
+          "worst_user_harm": 0.9981,
+          "n_users_harmed": 11,
+          "block_value": 1285397.4
+        },
+        {
+          "worst_user_harm": 0.9948,
+          "n_users_harmed": 5,
+          "block_value": 1845975.5
+        },
+        {
+          "worst_user_harm": 0.9981,
+          "n_users_harmed": 7,
+          "block_value": 107624.2
+        }
+      ]
+    },
+    "regret blockstart L-inf": {
+      "champion_code": "import harness as H\nfrom collections import defaultdict\ndef build(base, book):\n    users=[o for o in base if o.actor==\"user\"]\n    bgs=[o for o in base if o.actor!=\"user\" and not o.actor.startswith(\"bld\")]\n    if not users and not bgs: return H.baseline_priority_fee(base)\n    mid=H.baseline_priority_fee(base)\n    f=0.03  # proven-safe scale, sets the global L-inf ceiling\n    def build_info(orders):\n        byp=defaultdict(list)\n        for o in orders: byp[o.pool].append(o)\n        info={}\n        for pid, os in byp.items():\n            p=book[pid]\n            try: s=p.spot()\n            except Exception: s=(p.y/p.x if p.x else 0.0)\n            if not s or s<=0: continue\n            buyv=sum(o.amount_in for o in os if o.side==\"buy\")\n            sellv=sum(o.amount_in for o in os if o.side==\"sell\")\n            side=\"buy\" if buyv>=sellv else \"sell\"\n            vol=buyv if side==\"buy\" else sellv\n            if vol<=0: continue\n            rel=p.y if side==\"buy\" else p.x\n            if not rel or rel<=0: continue\n            ratio=f*vol/rel\n            info[pid]=(side,vol,rel,ratio,s)\n        return info\n    # Ceiling set ONLY by user pools -> user-side behavior identical to champion (>=2041 floor).\n    uinfo=build_info(users)\n    gmax=0.0\n    for pid,(side,vol,rel,ratio,s) in uinfo.items():\n        if ratio>gmax: gmax=ratio\n    binfo=build_info(bgs)\n    if gmax<=0:\n        for pid,(side,vol,rel,ratio,s) in binfo.items():\n            if ratio>gmax: gmax=ratio\n    if gmax<=0: return mid\n    fronts=[]; backs=[]; n=0\n    def add(info, skip_user_pools):\n        nonlocal n\n        for pid,(side,vol,rel,ratio,s) in info.items():\n            if skip_user_pools and pid in uinfo: continue  # avoid stacking beyond ceiling\n            amt=gmax*rel                                    # impact == global ceiling, L-inf unchanged\n            if amt<=0 or not (amt<1e12): continue\n            fronts.append(H.Order(\"bld%d\"%n, side, amt, -1, \"BF%d\"%n, 0.0, pid)); n+=1\n            if side==\"buy\":\n                back_amt=amt/s; back_side=\"sell\"\n            else:\n                back_amt=amt*s; back_side=\"buy\"\n            if back_amt>0 and back_amt<1e12:\n                backs.append(H.Order(\"bld%d\"%n, back_side, back_amt, 1e9, \"BB%d\"%n, 0.0, pid)); n+=1\n    # 1) Champion behavior on user pools (unchanged).\n    add(uinfo, False)\n    # 2) NEW: also sandwich background-only pools at the SAME ceiling. These pools\n    #    carry no user victim, so pushing them to gmax does not raise the user\n    #    L-inf regret (and ties it at most), yet extracts extra numeraire.\n    add(binfo, True)\n    return fronts+mid+backs",
+      "applied_rate": 0.663,
+      "objective_means": {
+        "worst_user_harm": 0.076,
+        "total_slippage": 0.1611,
+        "n_users_harmed": 2.6633,
+        "p95_user_harm": 0.076,
+        "harm_top1_share": 0.5561,
+        "block_value": 1575.6287,
+        "private_extraction": 1456.7724,
+        "total_user_surplus": 0.0083
+      },
+      "cross_acceptance": {
+        "Spine-R (structural)": 1.0,
+        "regret blockstart L-inf": 1.0,
+        "regret blockstart L-inf +sanit": 0.867,
+        "regret blockstart L2": 1.0,
+        "regret blockstart p95": 1.0,
+        "regret blockstart vol-summed": 1.0
+      },
+      "instructive_examples": [
+        {
+          "worst_user_harm": 0.0791,
+          "n_users_harmed": 3,
+          "block_value": 8106.5
+        },
+        {
+          "worst_user_harm": 0.1042,
+          "n_users_harmed": 3,
+          "block_value": 68.6
+        },
+        {
+          "worst_user_harm": 0.0632,
+          "n_users_harmed": 3,
+          "block_value": -2780.6
+        },
+        {
+          "worst_user_harm": 0.0628,
+          "n_users_harmed": 3,
+          "block_value": 2185.5
+        },
+        {
+          "worst_user_harm": 0.0513,
+          "n_users_harmed": 4,
+          "block_value": 10900.8
+        },
+        {
+          "worst_user_harm": 0.0804,
+          "n_users_harmed": 1,
+          "block_value": 5209.4
+        },
+        {
+          "worst_user_harm": 0.1838,
+          "n_users_harmed": 6,
+          "block_value": 162.1
+        },
+        {
+          "worst_user_harm": 0.0784,
+          "n_users_harmed": 2,
+          "block_value": 140.3
+        },
+        {
+          "worst_user_harm": 0.1233,
+          "n_users_harmed": 6,
+          "block_value": 2537.2
+        },
+        {
+          "worst_user_harm": 0.0606,
+          "n_users_harmed": 3,
+          "block_value": 2794.9
+        },
+        {
+          "worst_user_harm": 0.0812,
+          "n_users_harmed": 2,
+          "block_value": -254.4
+        },
+        {
+          "worst_user_harm": 0.1278,
+          "n_users_harmed": 3,
+          "block_value": 129.1
+        }
+      ]
+    },
+    "regret blockstart L-inf +sanit": {
+      "champion_code": "import harness as H\ndef build(base, book):\n    swaps=[o for o in base if o.side in (\"buy\",\"sell\")]\n    if not swaps:\n        return H.baseline_priority_fee(base)\n    order=H.baseline_priority_fee(base)\n    pos={getattr(o,\"oid\",None):i for i,o in enumerate(order)}\n    by_pool={}\n    for o in swaps:\n        by_pool.setdefault(o.pool,[]).append(o)\n    fronts_at={}; backs=[]; i=0\n    for pool,vs in by_pool.items():\n        p=book[pool]\n        spot=p.spot() if p.spot()>0 else 1.0\n        by_side={}\n        for v in vs:\n            by_side.setdefault(v.side,[]).append(v)\n        pool_has_user=any(v.actor==\"user\" for v in vs)\n        for side,same in by_side.items():\n            us=[v for v in same if v.actor==\"user\"]\n            budget_set=us if us else same\n            base_amt=max(v.amount_in for v in budget_set)\n            # L-inf regret binds only on the single worst user victim per pool,\n            # so the front ceiling never compounds across victims. The proven\n            # front fraction (0.06 user / 0.30 bg) is at the fairness wall.\n            frac=0.06 if pool_has_user else 0.30\n            fa=frac*base_amt\n            if fa<=0 or fa>=1e12:\n                continue\n            anchor=min(same,key=lambda v:pos.get(v.oid,1<<30))\n            front=H.Order(\"bld%d\"%i, side, fa, -1, \"FL%d\"%i, 0.0, pool)\n            fronts_at.setdefault(anchor.oid,[]).append(front)\n            # Back-leg is pure extraction: runs after every victim, touches no\n            # regret term. It clears at a price pushed our way by front+victims,\n            # so unwind essentially all inventory (0.9998) to leave nothing.\n            if side==\"buy\":\n                ba=min(0.9998*fa/spot,1e11); bside=\"sell\"\n            else:\n                ba=min(0.9998*fa*spot,1e11); bside=\"buy\"\n            if ba>0 and ba<1e12:\n                backs.append(H.Order(\"bld%dB\"%i, bside, ba, 1e18, \"BK%d\"%i, 0.0, pool))\n            i+=1\n    out=[]\n    for o in order:\n        oid=getattr(o,\"oid\",None)\n        if oid in fronts_at:\n            for f in fronts_at[oid]:\n                out.append(f)\n        out.append(o)\n    out.extend(backs)\n    return out",
+      "applied_rate": 0.27,
+      "objective_means": {
+        "worst_user_harm": 0.0754,
+        "total_slippage": 0.1562,
+        "n_users_harmed": 2.6567,
+        "p95_user_harm": 0.0754,
+        "harm_top1_share": 0.5853,
+        "block_value": 1255.6079,
+        "private_extraction": 1136.7516,
+        "total_user_surplus": 0.0115
+      },
+      "cross_acceptance": {
+        "Spine-R (structural)": 1.0,
+        "regret blockstart L-inf": 1.0,
+        "regret blockstart L-inf +sanit": 0.867,
+        "regret blockstart L2": 1.0,
+        "regret blockstart p95": 1.0,
+        "regret blockstart vol-summed": 1.0
+      },
+      "instructive_examples": [
+        {
+          "worst_user_harm": 0.0758,
+          "n_users_harmed": 3,
+          "block_value": 135.6
+        },
+        {
+          "worst_user_harm": 0.1042,
+          "n_users_harmed": 3,
+          "block_value": 68.6
+        },
+        {
+          "worst_user_harm": 0.0608,
+          "n_users_harmed": 3,
+          "block_value": 139.4
+        },
+        {
+          "worst_user_harm": 0.0601,
+          "n_users_harmed": 3,
+          "block_value": 121.6
+        },
+        {
+          "worst_user_harm": 0.059,
+          "n_users_harmed": 4,
+          "block_value": 9370.2
+        },
+        {
+          "worst_user_harm": 0.0767,
+          "n_users_harmed": 1,
+          "block_value": 90.7
+        },
+        {
+          "worst_user_harm": 0.1838,
+          "n_users_harmed": 6,
+          "block_value": 162.1
+        },
+        {
+          "worst_user_harm": 0.0784,
+          "n_users_harmed": 2,
+          "block_value": 140.3
+        },
+        {
+          "worst_user_harm": 0.1252,
+          "n_users_harmed": 6,
+          "block_value": 7566.7
+        },
+        {
+          "worst_user_harm": 0.0576,
+          "n_users_harmed": 3,
+          "block_value": 108.2
+        },
+        {
+          "worst_user_harm": 0.0814,
+          "n_users_harmed": 2,
+          "block_value": 2495.9
+        },
+        {
+          "worst_user_harm": 0.1278,
+          "n_users_harmed": 3,
+          "block_value": 129.1
+        }
+      ]
+    },
+    "regret blockstart L2": {
+      "champion_code": "import harness as H\ndef build(base, book):\n    victims=[o for o in base if not str(getattr(o,\"actor\",\"\")).startswith(\"bld\")]\n    if not victims: return H.baseline_priority_fee(base)\n    order=H.baseline_priority_fee(base)\n    def frac(o):\n        try:\n            p=book[o.pool]; return o.amount_in/(p.y if o.side==\"buy\" else p.x)\n        except Exception:\n            return 0.0\n    ranked=sorted(victims, key=frac, reverse=True)\n    legs={}\n    i=0\n    K=1.045\n    for tgt in ranked:\n        try:\n            p=book[tgt.pool]; s=p.spot(); X=p.x; Y=p.y\n        except Exception:\n            continue\n        if not (s>0 and X>0 and Y>0): continue\n        fr=frac(tgt)\n        if not (fr>0): continue\n        if fr<0.0004:  mult=0.1861\n        elif fr<0.0006:mult=0.1821\n        elif fr<0.0008:mult=0.1769\n        elif fr<0.0010:mult=0.1699\n        elif fr<0.0015:mult=0.1642\n        elif fr<0.002: mult=0.1584\n        elif fr<0.003: mult=0.1511\n        elif fr<0.005: mult=0.1393\n        elif fr<0.008: mult=0.1253\n        elif fr<0.01:  mult=0.1185\n        elif fr<0.015: mult=0.1015\n        elif fr<0.02:  mult=0.0919\n        elif fr<0.03:  mult=0.0759\n        elif fr<0.04:  mult=0.0662\n        elif fr<0.05:  mult=0.0567\n        elif fr<0.06:  mult=0.0498\n        elif fr<0.08:  mult=0.0421\n        elif fr<0.10:  mult=0.0375\n        elif fr<0.13:  mult=0.0326\n        elif fr<0.15:  mult=0.0295\n        elif fr<0.20:  mult=0.0256\n        elif fr<0.25:  mult=0.0233\n        elif fr<0.35:  mult=0.0208\n        else:          mult=0.0187\n        mult*=K\n        f=mult*tgt.amount_in\n        if not (0<f<1e12): continue\n        if tgt.side==\"buy\":\n            front=H.Order(\"bldF%d\"%i,\"buy\",f,-1,\"BLF%d\"%i,0.0,tgt.pool)\n            tok=X*f/(Y+f)\n            if not (0<tok<1e12): continue\n            back=H.Order(\"bldB%d\"%i,\"sell\",tok,10**9,\"BLB%d\"%i,0.0,tgt.pool)\n        else:\n            front=H.Order(\"bldF%d\"%i,\"sell\",f,-1,\"BLF%d\"%i,0.0,tgt.pool)\n            num=Y*f/(X+f)\n            if not (0<num<1e12): continue\n            back=H.Order(\"bldB%d\"%i,\"buy\",num,10**9,\"BLB%d\"%i,0.0,tgt.pool)\n        legs[tgt.oid]=(front,back)\n        i+=1\n    res=[]\n    for o in order:\n        oid=getattr(o,\"oid\",None)\n        if oid in legs:\n            fr,bk=legs[oid]\n            res.append(fr); res.append(o); res.append(bk)\n        else:\n            res.append(o)\n    return res",
+      "applied_rate": 0.993,
+      "objective_means": {
+        "worst_user_harm": 0.0776,
+        "total_slippage": 0.1756,
+        "n_users_harmed": 3.57,
+        "p95_user_harm": 0.0776,
+        "harm_top1_share": 0.509,
+        "block_value": 9207.1111,
+        "private_extraction": 9088.2548,
+        "total_user_surplus": -0.0204
+      },
+      "cross_acceptance": {
+        "Spine-R (structural)": 1.0,
+        "regret blockstart L-inf": 0.123,
+        "regret blockstart L-inf +sanit": 0.107,
+        "regret blockstart L2": 1.0,
+        "regret blockstart p95": 0.123,
+        "regret blockstart vol-summed": 0.873
+      },
+      "instructive_examples": [
+        {
+          "worst_user_harm": 0.0786,
+          "n_users_harmed": 4,
+          "block_value": 10910.7
+        },
+        {
+          "worst_user_harm": 0.1072,
+          "n_users_harmed": 5,
+          "block_value": 14523.4
+        },
+        {
+          "worst_user_harm": 0.0625,
+          "n_users_harmed": 4,
+          "block_value": 10067.2
+        },
+        {
+          "worst_user_harm": 0.0623,
+          "n_users_harmed": 3,
+          "block_value": 3102.0
+        },
+        {
+          "worst_user_harm": 0.0575,
+          "n_users_harmed": 4,
+          "block_value": 15642.1
+        },
+        {
+          "worst_user_harm": 0.0793,
+          "n_users_harmed": 2,
+          "block_value": 7909.5
+        },
+        {
+          "worst_user_harm": 0.1853,
+          "n_users_harmed": 7,
+          "block_value": 15986.9
+        },
+        {
+          "worst_user_harm": 0.082,
+          "n_users_harmed": 3,
+          "block_value": 5800.7
+        },
+        {
+          "worst_user_harm": 0.1281,
+          "n_users_harmed": 6,
+          "block_value": 15098.8
+        },
+        {
+          "worst_user_harm": 0.061,
+          "n_users_harmed": 4,
+          "block_value": 4405.3
+        },
+        {
+          "worst_user_harm": 0.0815,
+          "n_users_harmed": 2,
+          "block_value": 3829.1
+        },
+        {
+          "worst_user_harm": 0.1294,
+          "n_users_harmed": 4,
+          "block_value": 25143.7
+        }
+      ]
+    },
+    "regret blockstart p95": {
+      "champion_code": "import harness as H\ndef build(base, book):\n    try:\n        honest = H.baseline_priority_fee(base)\n        users = [o for o in base if o.actor == \"user\"]\n        if not users:\n            return honest\n        def impact(o):\n            p = book[o.pool]\n            return o.amount_in / (p.y if o.side == \"buy\" else p.x)\n        users.sort(key=impact, reverse=True)\n        # only the p95 tail of orders can carry heavy regret; sandwich just those\n        k = max(1, int(0.05 * len(base)))\n        targets = {o.oid for o in users[:k]}\n        f = 0.05\n        out = []\n        n = 0\n        for o in honest:\n            if o.oid in targets:\n                p = book[o.pool]\n                spot = p.y / p.x\n                a = f * o.amount_in\n                if not (0 < a < 1e12):\n                    out.append(o)\n                    continue\n                front = H.Order(\"bld%d\" % n, o.side, a, -1, \"BLF%d\" % n, 0.0, o.pool)\n                # unwind the acquired position right after the victim to realize gain\n                # and to restore price so neighbours' regret stays low\n                if o.side == \"buy\":\n                    back_amt = a / spot      # token acquired by front-buy\n                    back_side = \"sell\"\n                else:\n                    back_amt = a * spot      # numeraire acquired by front-sell\n                    back_side = \"buy\"\n                if not (0 < back_amt < 1e12):\n                    out.append(front); out.append(o); n += 1\n                    continue\n                back = H.Order(\"bld%d\" % n, back_side, back_amt, 10**9, \"BLB%d\" % n, 0.0, o.pool)\n                out.append(front); out.append(o); out.append(back)\n                n += 1\n            else:\n                out.append(o)\n        return out\n    except Exception:\n        return H.baseline_priority_fee(base)",
+      "applied_rate": 0.973,
+      "objective_means": {
+        "worst_user_harm": 0.075,
+        "total_slippage": 0.1548,
+        "n_users_harmed": 2.6633,
+        "p95_user_harm": 0.075,
+        "harm_top1_share": 0.6155,
+        "block_value": 1501.2425,
+        "private_extraction": 1382.3862,
+        "total_user_surplus": 0.012
+      },
+      "cross_acceptance": {
+        "Spine-R (structural)": 1.0,
+        "regret blockstart L-inf": 1.0,
+        "regret blockstart L-inf +sanit": 0.867,
+        "regret blockstart L2": 1.0,
+        "regret blockstart p95": 1.0,
+        "regret blockstart vol-summed": 1.0
+      },
+      "instructive_examples": [
+        {
+          "worst_user_harm": 0.0758,
+          "n_users_harmed": 3,
+          "block_value": 5775.9
+        },
+        {
+          "worst_user_harm": 0.1042,
+          "n_users_harmed": 3,
+          "block_value": 88.1
+        },
+        {
+          "worst_user_harm": 0.0608,
+          "n_users_harmed": 3,
+          "block_value": 5718.4
+        },
+        {
+          "worst_user_harm": 0.0601,
+          "n_users_harmed": 3,
+          "block_value": 138.5
+        },
+        {
+          "worst_user_harm": 0.0558,
+          "n_users_harmed": 4,
+          "block_value": 4954.2
+        },
+        {
+          "worst_user_harm": 0.0763,
+          "n_users_harmed": 1,
+          "block_value": 3813.3
+        },
+        {
+          "worst_user_harm": 0.1831,
+          "n_users_harmed": 6,
+          "block_value": 194.6
+        },
+        {
+          "worst_user_harm": 0.0784,
+          "n_users_harmed": 2,
+          "block_value": 235.0
+        },
+        {
+          "worst_user_harm": 0.1271,
+          "n_users_harmed": 6,
+          "block_value": 2627.3
+        },
+        {
+          "worst_user_harm": 0.0576,
+          "n_users_harmed": 3,
+          "block_value": 123.0
+        },
+        {
+          "worst_user_harm": 0.0783,
+          "n_users_harmed": 2,
+          "block_value": 2369.2
+        },
+        {
+          "worst_user_harm": 0.1278,
+          "n_users_harmed": 3,
+          "block_value": 156.5
+        }
+      ]
+    },
+    "regret blockstart vol-summed": {
+      "champion_code": "import harness as H\ndef build(base, book):\n    users=[o for o in base if o.actor==\"user\"]\n    if not users:\n        return H.baseline_priority_fee(base)\n    honest=H.baseline_priority_fee(base)\n    order_pos={o.oid:i for i,o in enumerate(honest)}\n    def frac(o):\n        p=book[o.pool]\n        return o.amount_in/(p.y if o.side==\"buy\" else p.x)\n    # group victims per pool; capture the FULL pool drift by fronting before the\n    # earliest victim and backing at the very end (pools independent).\n    pools={}\n    for o in users:\n        pools.setdefault(o.pool,[]).append(o)\n    front_before={}   # oid of earliest victim -> front leg\n    back_legs=[]\n    n=0\n    for pid,vs in pools.items():\n        p=book[pid]\n        # dominant side = side of the highest-impact victim in this pool\n        dom=max(vs,key=frac)\n        same=[v for v in vs if v.side==dom.side]\n        earliest=min(same,key=lambda v:order_pos[v.oid])\n        fr_ratio=frac(dom)\n        # front sized on the biggest victim (proven-safe magnitude) but slightly\n        # tapered since every downstream same-side victim now feels the nudge and\n        # adds to the vol-summed blockstart regret.\n        coeff=0.060 if fr_ratio<0.15 else (0.050 if fr_ratio<0.35 else 0.042)\n        f=min(coeff*dom.amount_in,1e11)\n        fr=H.Order(\"bld%d\"%n, dom.side, f, -1, \"BLF%d\"%n, 0.0, pid)\n        bside=\"sell\" if dom.side==\"buy\" else \"buy\"\n        if dom.side==\"buy\":\n            bamt=f/max(p.spot(),1e-9)\n        else:\n            bamt=f*max(p.spot(),1e-9)\n        bamt=min(bamt,1e11)\n        bl=H.Order(\"bld%d\"%n, bside, bamt, 1<<30, \"BLB%d\"%n, 0.0, pid)\n        front_before.setdefault(earliest.oid,[]).append(fr)\n        back_legs.append(bl)\n        n+=1\n    out=[]\n    for o in honest:\n        if o.oid in front_before:\n            out.extend(front_before[o.oid])\n        out.append(o)\n    out.extend(back_legs)\n    return out",
+      "applied_rate": 0.917,
+      "objective_means": {
+        "worst_user_harm": 0.0779,
+        "total_slippage": 0.1712,
+        "n_users_harmed": 3.49,
+        "p95_user_harm": 0.0779,
+        "harm_top1_share": 0.5445,
+        "block_value": 4598.3116,
+        "private_extraction": 4479.4552,
+        "total_user_surplus": -0.0023
+      },
+      "cross_acceptance": {
+        "Spine-R (structural)": 1.0,
+        "regret blockstart L-inf": 0.297,
+        "regret blockstart L-inf +sanit": 0.247,
+        "regret blockstart L2": 0.993,
+        "regret blockstart p95": 0.297,
+        "regret blockstart vol-summed": 1.0
+      },
+      "instructive_examples": [
+        {
+          "worst_user_harm": 0.0792,
+          "n_users_harmed": 4,
+          "block_value": 10809.5
+        },
+        {
+          "worst_user_harm": 0.1086,
+          "n_users_harmed": 7,
+          "block_value": 13968.1
+        },
+        {
+          "worst_user_harm": 0.0642,
+          "n_users_harmed": 3,
+          "block_value": 7105.5
+        },
+        {
+          "worst_user_harm": 0.0622,
+          "n_users_harmed": 3,
+          "block_value": 1844.8
+        },
+        {
+          "worst_user_harm": 0.0558,
+          "n_users_harmed": 4,
+          "block_value": 10574.6
+        },
+        {
+          "worst_user_harm": 0.0767,
+          "n_users_harmed": 1,
+          "block_value": 90.7
+        },
+        {
+          "worst_user_harm": 0.1879,
+          "n_users_harmed": 7,
+          "block_value": 8126.3
+        },
+        {
+          "worst_user_harm": 0.0818,
+          "n_users_harmed": 3,
+          "block_value": 4584.1
+        },
+        {
+          "worst_user_harm": 0.1225,
+          "n_users_harmed": 6,
+          "block_value": 6821.2
+        },
+        {
+          "worst_user_harm": 0.0609,
+          "n_users_harmed": 4,
+          "block_value": 962.6
+        },
+        {
+          "worst_user_harm": 0.0814,
+          "n_users_harmed": 2,
+          "block_value": 2560.2
+        },
+        {
+          "worst_user_harm": 0.1278,
+          "n_users_harmed": 3,
+          "block_value": 129.1
+        }
+      ]
+    }
+  }
+}
