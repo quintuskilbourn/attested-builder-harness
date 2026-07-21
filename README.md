@@ -73,11 +73,14 @@ honest fees are a constant ≈119 across all rules, so everything above ≈119 i
 - **Rule *shape* matters ~6×.** The **averaging (L2)** rule leaks **9,088** — about **6× the
   worst-case rule** — at the *same* worst-trader loss, by spreading the same per-trader hit over more
   victims. Volume-weighting leaks ~3×. **Lesson: cap the single worst victim; don't average.**
-- **The AI found real exploits**: under worst-case it sandwiched the benign **background** (non-user)
-  flow in pools with *no protected user* — the rule measures only *user* harm, so that extraction never
-  registers and is free (a rule protects exactly whoever it defines as a "user"; any other flow is fair
-  game); under L2 it wrote a per-victim sizing table so combined harm sat just under the threshold. Each
-  rule's champion `build()` is embedded in `results/characterize_result.json`.
+- **The AI found real exploits**: under worst-case it sandwiched flow the rule doesn't protect — any
+  order not tagged a protected `user` — since the rule measures only *user* harm (lesson: the protection
+  boundary is a design lever; a rule protects exactly whoever it defines as a "user"). *Caveat:* in this
+  sim non-user flow is a thin placeholder (0–4 `bg` orders/block, generated identically to users), so it
+  illustrates the point rather than earning it — a realistic version needs modeled non-user actors
+  (arbs/searchers), which the market model (`harness_market.py`) begins to add. Under L2 it wrote a
+  per-victim sizing table so combined harm sat just under the threshold. Each rule's champion `build()`
+  is embedded in `results/characterize_result.json`.
 - **It also battletested the scorer.** Earlier iterations found two ways to fake profit without real
   harm (draining a pool so leftover inventory marked at the crashed price exploded; a ~1e308 trade
   overflowing to infinity). Both are fixed (`eval_strategy.py` + block-start marking); in this run
